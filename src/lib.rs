@@ -13,6 +13,10 @@ use serde::Deserialize;
 use serde_wasm_bindgen::from_value;
 //use std::time::Duration;
 //use wasm_bindgen_futures::futures_0_3::FutureExt;
+use futures::channel::mpsc;
+use futures::StreamExt;
+use lazy_static::lazy_static;
+use std::sync::{Arc, Mutex};
 use wgpu::util::DeviceExt;
 use winit::dpi::LogicalSize;
 use winit::dpi::PhysicalSize;
@@ -339,6 +343,7 @@ struct LightUniform {
 ///
 /// The `State` struct is typically instantiated once at the start of the application, and then passed by reference to any functions or methods that need to access or modify the shared state.
 struct State {
+    canvas: HtmlCanvasElement,
     // Graphic context
     surface: wgpu::Surface,
     device: wgpu::Device,
@@ -352,6 +357,8 @@ struct State {
     render_pipeline: wgpu::RenderPipeline,
     // Textures
     depth_texture: texture::Texture,
+    // The layout for binding texture resources in a bind group.
+    texture_bind_group_layout: wgpu::BindGroupLayout,
     // Camera
     camera: Camera,
     camera_controller: CameraController,
@@ -361,8 +368,8 @@ struct State {
     // Instances
     instances: Vec<Instance>,
     instance_buffer: wgpu::Buffer,
-    // 3D Model
-    obj_model: model::Model,
+    // 3D Models
+    obj_models: Vec<model::Model>,
     // Lighting
     light_uniform: LightUniform,
     light_buffer: wgpu::Buffer,
@@ -447,7 +454,18 @@ fn create_render_pipeline(
 /// - `render`: This method is called once per frame. It renders the current frame to the surface.
 impl State {
     // Initialize the state
-    async fn new(canvas: HtmlCanvasElement, model_uri: &str, extension: &str) -> Self {
+    async fn new(
+        canvas: HtmlCanvasElement,
+        model_uris: Vec<String>,
+        extensions: Vec<String>,
+    ) -> Result<Self, String> {
+        if model_uris.len() != extensions.len() {
+            return Err(String::from(
+                "model_uris and extensions vectors must have the same length",
+            ));
+        }
+
+        let canvas = canvas.clone();
         let size = winit::dpi::PhysicalSize::new(canvas.width(), canvas.height());
 
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
@@ -457,7 +475,8 @@ impl State {
             gles_minor_version: wgpu::Gles3MinorVersion::Version2,
         });
 
-        let surface = unsafe { instance.create_surface_from_canvas(canvas) }
+        let surface = instance
+            .create_surface_from_canvas(canvas.clone())
             .expect("Failed to create surface");
 
         let adapter = instance
@@ -613,15 +632,21 @@ impl State {
         // Load model from disk or as a HTTP request (for web support)
         log::warn!("Load model");
 
-        let obj_model = resources::load_model(
-            model_uri,
-            extension,
-            &device,
-            &queue,
-            &texture_bind_group_layout,
-        )
-        .await
-        .expect("Couldn't load model. Maybe path is wrong?");
+        let mut obj_models = Vec::new();
+
+        for (model_uri, extension) in model_uris.iter().zip(extensions.iter()) {
+            let obj_model = resources::load_model(
+                model_uri.as_str(),
+                extension,
+                &device,
+                &queue,
+                &texture_bind_group_layout,
+            )
+            .await
+            .expect("Couldn't load model. Maybe path is wrong?");
+
+            obj_models.push(obj_model);
+        }
 
         // Lighting
         // Create light uniforms and setup buffer for them
@@ -718,7 +743,8 @@ impl State {
         // Clear color used for mouse input interaction
         let clear_color = wgpu::Color::BLACK;
 
-        Self {
+        Ok(Self {
+            canvas,
             surface,
             device,
             queue,
@@ -727,6 +753,7 @@ impl State {
             size,
             render_pipeline,
             depth_texture,
+            texture_bind_group_layout,
             camera,
             camera_controller,
             camera_buffer,
@@ -734,12 +761,66 @@ impl State {
             camera_uniform,
             instances,
             instance_buffer,
-            obj_model,
+            obj_models,
             light_uniform,
             light_buffer,
             light_bind_group,
             light_render_pipeline,
+        })
+    }
+
+    pub async fn load_model(
+        &mut self,
+        model_uris: Vec<String>,
+        extensions: Vec<String>,
+    ) -> Result<(), String> {
+        if model_uris.len() != extensions.len() {
+            return Err(String::from(
+                "load_model: model_uris and extensions vectors must have the same length",
+            ));
         }
+
+        web_sys::console::log_1(&JsValue::from_str("wgpu_renderer: Load model"));
+        log::warn!("Load model");
+
+        let mut obj_models = Vec::new();
+
+        web_sys::console::log_1(&JsValue::from_str(
+            "wgpu_renderer: let mut obj_models = Vec::new();",
+        ));
+
+        for (model_uri, extension) in model_uris.iter().zip(extensions.iter()) {
+            web_sys::console::log_1(&JsValue::from_str(
+                "wgpu_renderer: before resources::load_model",
+            ));
+
+            let obj_model = resources::load_model(
+                model_uri.as_str(),
+                extension,
+                &self.device,
+                &self.queue,
+                &self.texture_bind_group_layout,
+            )
+            .await
+            .map_err(|_| format!("wgpu_renderer: Couldn't load model from uri: {}", model_uri))?;
+
+            web_sys::console::log_1(&JsValue::from_str(
+                "wgpu_renderer: after resources::load_model",
+            ));
+
+            obj_models.push(obj_model);
+
+            web_sys::console::log_1(&JsValue::from_str(
+                "wgpu_renderer: obj_models.push(obj_model);",
+            ));
+        }
+
+        self.obj_models = obj_models;
+        web_sys::console::log_1(&JsValue::from_str(
+            "wgpu_renderer: self.obj_models = obj_models; ",
+        ));
+
+        Ok(())
     }
 
     // Keeps state in sync with window size when changed
@@ -817,16 +898,22 @@ impl State {
     ///
     /// The method is marked as `mut` because it may change the state of the `State` struct, for example, by updating the current frame number or other fields related to rendering state.
     fn render(&mut self) -> Result<(), wgpu::SurfaceError> {
+        //        web_sys::console::log_1(&JsValue::from_str("wgpu_renderer: render: inside"));
+
         let output = self.surface.get_current_texture()?;
         let view = output
             .texture
             .create_view(&wgpu::TextureViewDescriptor::default());
+
+        //        web_sys::console::log_1(&JsValue::from_str("wgpu_renderer: render: 1"));
 
         let mut encoder = self
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("Render Encoder"),
             });
+
+        //        web_sys::console::log_1(&JsValue::from_str("wgpu_renderer: render: 2"));
 
         {
             let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -864,31 +951,43 @@ impl State {
                 timestamp_writes: None,
             });
 
+            //            web_sys::console::log_1(&JsValue::from_str("wgpu_renderer: render: 3"));
+
             // Setup our render pipeline with our config earlier in `new()`
             render_pass.set_vertex_buffer(1, self.instance_buffer.slice(..));
 
             // Setup lighting pipeline
             render_pass.set_pipeline(&self.light_render_pipeline);
             // Draw/calculate the lighting on models
-            render_pass.draw_light_model(
-                &self.obj_model,
-                &self.camera_bind_group,
-                &self.light_bind_group,
-            );
+            for obj_model in &self.obj_models {
+                render_pass.draw_light_model(
+                    obj_model,
+                    &self.camera_bind_group,
+                    &self.light_bind_group,
+                );
+            }
+
+            //            web_sys::console::log_1(&JsValue::from_str("wgpu_renderer: render: 4"));
 
             // Setup render pipeline
             render_pass.set_pipeline(&self.render_pipeline);
             // Draw the models
-            render_pass.draw_model_instanced(
-                &self.obj_model,
-                0..self.instances.len() as u32,
-                &self.camera_bind_group,
-                &self.light_bind_group,
-            );
+            for obj_model in &self.obj_models {
+                render_pass.draw_model_instanced(
+                    obj_model,
+                    0..self.instances.len() as u32,
+                    &self.camera_bind_group,
+                    &self.light_bind_group,
+                );
+            }
         }
+
+        //        web_sys::console::log_1(&JsValue::from_str("wgpu_renderer: render: 5"));
 
         self.queue.submit(iter::once(encoder.finish()));
         output.present();
+
+        //        web_sys::console::log_1(&JsValue::from_str("wgpu_renderer: render: 6"));
 
         Ok(())
     }
@@ -926,16 +1025,82 @@ fn get_canvas_size_from_javascript() -> winit::dpi::PhysicalSize<u32> {
 static mut CONTINUE_RENDERING: bool = true;
 
 #[wasm_bindgen]
-pub async fn stop_rendering(canvas: HtmlCanvasElement) {
+pub async fn stop_render() {
     // When this function is called from JavaScript, it sets the flag to false,
     // indicating that the rendering should stop.
     unsafe {
         CONTINUE_RENDERING = false;
+        web_sys::console::log_1(&JsValue::from_str(
+            "wgpu_renderer: set flag to stop rendering",
+        ));
+    }
+}
+
+lazy_static! {
+    static ref SENDER: Mutex<mpsc::Sender<(Vec<String>, Vec<String>)>> = {
+        let (sender, receiver) = mpsc::channel(1);
+        *RECEIVER.lock().unwrap() = Some(receiver);
+        Mutex::new(sender)
+    };
+    static ref RECEIVER: Mutex<Option<mpsc::Receiver<(Vec<String>, Vec<String>)>>> =
+        Mutex::new(None);
+}
+
+#[wasm_bindgen]
+pub fn load_model(model_uris: js_sys::Array, extensions: js_sys::Array) {
+    web_sys::console::log_1(&JsValue::from_str("wgpu_renderer: Inside load_model"));
+    let new_model_uris: Vec<String> = model_uris
+        .iter()
+        .map(|js_value| js_value.as_string().expect("Expected string in array"))
+        .collect();
+
+    let new_extensions: Vec<String> = extensions
+        .iter()
+        .map(|js_value| js_value.as_string().expect("Expected string in array"))
+        .collect();
+    web_sys::console::log_1(&JsValue::from_str(
+        "wgpu_renderer: new_extensions: Vec<String>",
+    ));
+
+    // Send the model_uris and extensions to the event loop
+    let mut sender = SENDER.lock().unwrap();
+
+    match sender.try_send((new_model_uris, new_extensions)) {
+        Ok(_) => {
+            // The message was sent successfully
+        }
+        Err(e) => {
+            // The send operation failed
+            web_sys::console::log_1(&JsValue::from_str(&format!(
+                "Failed to send message: {:?}",
+                e
+            )));
+        }
     }
 }
 
 #[wasm_bindgen]
-pub async fn render_model(canvas: HtmlCanvasElement, model_uri: &str, extension: &str) {
+pub async fn render_model(
+    canvas: HtmlCanvasElement,
+    model_uris: js_sys::Array,
+    extensions: js_sys::Array,
+    callback: JsValue, // Accepting a JavaScript function as a callback
+) {
+    web_sys::console::log_1(&JsValue::from_str("wgpu_renderer: Entered renderer"));
+    // unsafe {
+    //     CONTINUE_RENDERING = true;
+    // }
+
+    let model_uris: Vec<String> = model_uris
+        .iter()
+        .map(|js_value| js_value.as_string().expect("Expected string in array"))
+        .collect();
+
+    let extensions: Vec<String> = extensions
+        .iter()
+        .map(|js_value| js_value.as_string().expect("Expected string in array"))
+        .collect();
+
     static mut LOGGER_INITIALIZED: bool = false;
 
     cfg_if::cfg_if! {
@@ -985,18 +1150,78 @@ pub async fn render_model(canvas: HtmlCanvasElement, model_uri: &str, extension:
     // let frame_duration = 100.0; // 10 frames per second
 
     // State::new uses async code, so we're going to wait for it to finish
-    let mut state = State::new(canvas_clone, model_uri, extension).await;
+    let state = match State::new(canvas, model_uris, extensions).await {
+        Ok(state) => state,
+        Err(e) => {
+            // Handle error, log it to the console
+            web_sys::console::error_1(&JsValue::from_str(&e));
+            return;
+        }
+    };
 
     let future = async move {
         // your async code here
     };
 
+    // Ensure the callback is a function
+    if !callback.is_function() {
+        web_sys::console::error_1(&JsValue::from_str("Callback is not a function"));
+        return;
+    }
+
+    // Create a channel for sending model_uris and extensions from the closure to the event loop
+
+    let callback = js_sys::Function::from(callback);
+    let state = Arc::new(Mutex::new(state));
+    //let canvas_clone = canvas.clone();
+
     event_loop.spawn(move |event, future| {
         // If the flag is false, exit the program.
         unsafe {
             if !CONTINUE_RENDERING {
+                web_sys::console::log_1(&JsValue::from_str("wgpu_renderer: Rendering has stopped"));
                 CONTINUE_RENDERING = true;
-                return;
+                std::process::exit(0);
+            }
+        }
+
+        let mut receiver = RECEIVER.lock().unwrap();
+        if let Some(receiver) = receiver.as_mut() {
+            // Check if there are any new model_uris and extensions from the closure
+            match receiver.try_next() {
+                Ok(Some((new_model_uris, new_extensions))) => {
+                    web_sys::console::log_1(&JsValue::from_str(
+                        "wgpu_renderer: received channel message for load_model",
+                    ));
+
+                    let state_clone = Arc::clone(&state);
+                    wasm_bindgen_futures::spawn_local(async move {
+                        let mut state = state_clone.lock().unwrap();
+                        match state.load_model(new_model_uris, new_extensions).await {
+                            Ok(_) => {
+                                web_sys::console::log_1(&JsValue::from_str(
+                                    "wgpu_renderer: successfully loaded model",
+                                ));
+                            }
+                            Err(e) => {
+                                // Log the error
+                                web_sys::console::error_1(&JsValue::from_str(&e));
+                            }
+                        }
+                    });
+                }
+                Ok(None) => {
+                    // The sender has been dropped, and no more messages will be received
+                    web_sys::console::log_1(&JsValue::from_str(
+                        "wgpu_renderer: channel sender dropped, no more messages will be received",
+                    ));
+                }
+                Err(_) => {
+                    // No message was available
+                    // web_sys::console::log_1(&JsValue::from_str(
+                    //     "wgpu_renderer: no message available in the channel",
+                    // ));
+                }
             }
         }
 
@@ -1005,62 +1230,77 @@ pub async fn render_model(canvas: HtmlCanvasElement, model_uri: &str, extension:
                 ref event,
                 window_id,
             } if window_id == window.id() => {
-                if !state.input(event) {
-                    // Handle window events (like resizing, or key inputs)
-                    // This is stuff from `winit` -- see their docs for more info
-                    match event {
-                        WindowEvent::CloseRequested
-                        | WindowEvent::KeyboardInput {
-                            event:
-                                KeyEvent {
-                                    state: ElementState::Pressed,
-                                    physical_key: PhysicalKey::Code(KeyCode::Escape),
-                                    ..
-                                },
-                            ..
-                        } => return,
-                        _ => {}
+                if let Ok(mut state) = state.try_lock() {
+                    if !state.input(event) {
+                        match event {
+                            WindowEvent::CloseRequested
+                            | WindowEvent::KeyboardInput {
+                                event:
+                                    KeyEvent {
+                                        state: ElementState::Pressed,
+                                        physical_key: PhysicalKey::Code(KeyCode::Escape),
+                                        ..
+                                    },
+                                ..
+                            } => return,
+                            _ => {}
+                        }
                     }
+                } else {
+                    // The state mutex is locked, so we skip this iteration
                 }
             }
-            // Add match arms for other variants as needed...
-            _ => {
-                // Catch-all match arm for any other variants
-            }
+            _ => {}
         }
 
-        state.update();
-        match state.render() {
-            Ok(_) => {}
-            // Reconfigure the surface if it's lost or outdated
-            Err(wgpu::SurfaceError::Lost | wgpu::SurfaceError::Outdated) => {
-                state.resize(state.size)
+        {
+            if let Ok(mut state) = state.try_lock() {
+                let size = state.size;
+                state.update();
+
+                match state.render() {
+                    Ok(_) => {
+                        // Invoke the callback function after a successful render
+                        let this = JsValue::NULL;
+                        if let Err(e) = callback.call0(&this) {
+                            web_sys::console::error_1(&JsValue::from_str(&format!(
+                                "Callback error: {:?}",
+                                e
+                            )));
+                        }
+                    }
+                    // Reconfigure the surface if it's lost or outdated
+                    Err(wgpu::SurfaceError::Lost | wgpu::SurfaceError::Outdated) => {
+                        state.resize(size)
+                    }
+
+                    // The system is out of memory, we should probably quit
+                    Err(wgpu::SurfaceError::OutOfMemory) => unsafe { CONTINUE_RENDERING = false },
+
+                    Err(wgpu::SurfaceError::Timeout) => log::warn!("Surface timeout"),
+                }
+
+                // Get the current size of the canvas from JavaScript
+                let new_size = get_canvas_size_from_javascript();
+                let size = LogicalSize::new(new_size.width as f64, new_size.height as f64);
+                log::info!("Event::MainEventsCleared size = {:?}", size);
+
+                let scale_factor = window.scale_factor();
+                let physical_size: PhysicalSize<u32> = size.to_physical(scale_factor);
+                log::info!(
+                    "Event::MainEventsCleared physical_size = {:?}",
+                    physical_size
+                );
+
+                state.resize(physical_size);
+
+                let size_option = window.request_inner_size(physical_size);
+                if let Some(size) = size_option {
+                    log::info!("Inner size is now: {:?}", size);
+                } else {
+                    log::warn!("Failed to set inner size because window is not resizable");
+                }
             }
-            // The system is out of memory, we should probably quit
-            Err(wgpu::SurfaceError::OutOfMemory) => unsafe { CONTINUE_RENDERING = false },
-
-            Err(wgpu::SurfaceError::Timeout) => log::warn!("Surface timeout"),
-        }
-
-        // Get the current size of the canvas from JavaScript
-        let new_size = get_canvas_size_from_javascript();
-        let size = LogicalSize::new(new_size.width as f64, new_size.height as f64);
-        log::info!("Event::MainEventsCleared size = {:?}", size);
-
-        let scale_factor = window.scale_factor();
-        let physical_size: PhysicalSize<u32> = size.to_physical(scale_factor);
-        log::info!(
-            "Event::MainEventsCleared physical_size = {:?}",
-            physical_size
-        );
-
-        state.resize(physical_size);
-
-        let size_option = window.request_inner_size(physical_size);
-        if let Some(size) = size_option {
-            log::info!("Inner size is now: {:?}", size);
-        } else {
-            log::warn!("Failed to set inner size because window is not resizable");
         }
 
         // Request a redraw
