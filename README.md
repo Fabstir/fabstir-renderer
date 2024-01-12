@@ -12,5 +12,5 @@ The code and rendering logic is based on the tutorial
 
 1. Clone this repo:
 2. Compile the project:
-   $env:RUSTFLAGS='--cfg=web_sys_unstable_apis'; cargo build --target wasm32-unknown-unknown --release
+   $env:RUSTFLAGS='--cfg=web_sys_unstable_apis'; cargo build --target wasm32-unknown-unknown --release  
    wasm-bindgen target/wasm32-unknown-unknown/release/wgpu_fabstir_renderer.wasm --out-dir ./public --target web
